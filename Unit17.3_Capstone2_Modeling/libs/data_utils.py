@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 import matplotlib.pyplot as plt
+import shap
 
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import classification_report
@@ -412,9 +413,9 @@ def train_binary_classifiers(mh_obj):
     print('1. Hyperparameter optimization')
     print('==============================')
     # Find optimal params for LR
-    print('Logistic Regression:')
-    best_lr_pred, _, accuracy = train_model(mh_obj, lr_optimizer, train_lr_model)
-    print(f'Accuracy: {accuracy}')
+    #print('Logistic Regression:')
+    #best_lr_pred, _, accuracy = train_model(mh_obj, lr_optimizer, train_lr_model)
+    #print(f'Accuracy: {accuracy}')
     ## Find optimal params for LGBM
     print('LGBM:')
     best_lgb_pred, _, accuracy = train_model(mh_obj, lgb_optimizer, train_lgb_model)
@@ -429,8 +430,8 @@ def train_binary_classifiers(mh_obj):
     
     print('\n2. Model Performance')
     print('====================')
-    print('Logistic Regression:')
-    print_model_metrics(y_ts, best_lr_pred)
+    #print('Logistic Regression:')
+    #print_model_metrics(y_ts, best_lr_pred)
     print('LGB:')
     print_model_metrics(y_ts, best_lgb_pred)
     print('XGB:')
@@ -818,6 +819,52 @@ def TPOT_test(mh_df):
         print('Confusion Matrix:\n', result['confusion_matrix'])
         print('Classification Report:\n', result['classification_report'])
 
+def analyze_tradeoffs(mh_o, cb_get_model):
+
+    opt_threshold, precision, recall, thresholds, fitted_model = get_optimal_thresholds(
+        mh_o,
+        cb_get_model,
+        metric='f1'
+    )
+    # Prepare to store TP and FN
+    results = []
+
+    pos_th = [(idx, t) for idx, t in enumerate(thresholds) if t >= opt_threshold][:10]
+    neg_th = []#[(idx, t) for idx, t in enumerate(thresholds) if t < opt_threshold][:5]
+    _thresholds = neg_th + pos_th
+    # Reclassify model using the optimized TH.
+    for idx, threshold in _thresholds:
+        _, _, _, _, cm, _ = reclassify_model(
+            mh_o,
+            fitted_model,
+            threshold
+        )
+        results.append({
+            'Threshold': threshold, 
+            'Precision': f'{precision[idx]:.3f}',
+            'Recall': f'{recall[idx]:.3f}',
+            'True Positives': cm[1, 1], 
+            'False Negatives': cm[1, 0]
+        })
+    
+    return pd.DataFrame(results)
+    
+
+def get_prc_thresholds(mh_o, cb_get_model):
+    """Get precision_recall curve values, including test data predictions and the fitted model"""
+     # Get the train classifier
+    X_train, x_test, y_train, y_test = mh_o.X_train, mh_o.x_test, mh_o.y_train, mh_o.y_test
+    # Get our model and fit data
+    model = cb_get_model()
+    model.fit(X_train, y_train)
+    # Predict 
+    y_pred = model.predict_proba(x_test)[:, 1]
+    # return precision, recall, threshold 
+    precision, recall, thresholds = precision_recall_curve(y_test, y_pred)
+
+    return model, y_pred, precision, recall, thresholds 
+
+
 def get_optimal_thresholds(mh_df, cb_get_model, metric='f1'):
     """
     Get optimal precision/recall threshold for a binary category, with option to 
@@ -838,20 +885,13 @@ def get_optimal_thresholds(mh_df, cb_get_model, metric='f1'):
     recall | list - The list of recall values
     model | object - The fitted model
     """
-    # Get the train classifier
-    X_train, x_test, y_train, y_test = mh_df.X_train, mh_df.x_test, mh_df.y_train, mh_df.y_test
-    # Get our model and fit data
-    model = cb_get_model()
-    model.fit(X_train, y_train)
-    # Predict 
-    y_pred = model.predict_proba(x_test)[:, 1]
-    # Get metrics
-    precision, recall, thresholds = precision_recall_curve(y_test, y_pred)
+    # Get model, prediction and precision/recall values
+    model, y_pred, precision, recall, thresholds = get_prc_thresholds(mh_df, cb_get_model)
 
     scores = []
     if metric == 'f1':
         # Get F1 score for each threshold
-        scores = [f1_score(y_test, y_pred >= t) for t in thresholds]
+        scores = [f1_score(mh_df.y_test, y_pred >= t) for t in thresholds]
     elif metric == 'precision':
         scores = precision
     elif metric == 'recall':
@@ -865,9 +905,9 @@ def get_optimal_thresholds(mh_df, cb_get_model, metric='f1'):
     optimal_threshold = thresholds[optimal_idx]
     
     # Return the optimal TH and model
-    return optimal_threshold, precision, recall, model
+    return optimal_threshold, precision, recall, thresholds, model
 
-def reclassify_model(mh_df, model, optimal_th: float):
+def reclassify_model(mh_df, model, threshold: float):
     """
     Reclassify a model based on a class-1 precision/recall threshold. 
     Print results.
@@ -875,7 +915,7 @@ def reclassify_model(mh_df, model, optimal_th: float):
     ----------
     mh_df | MentalHealthData - The trained dataset
     model | object - The fitted model instance
-    optimal_th | float - The optimal precision/recall threshold value
+    threshold | float - The optimal precision/recall threshold value
     Returns:
     -------
     y_pred | List of class 1 predictions
@@ -885,13 +925,13 @@ def reclassify_model(mh_df, model, optimal_th: float):
     conf_matrix | List of confusion matrix
     class_report | str - The formatted classification report
     """
-    # Get the test classifier
+    # Get test sets
     x_test, y_test = mh_df.x_test, mh_df.y_test
     y_scores = model.predict_proba(x_test)[:, 1]
     # Reclassify based on the optimal threshold
-    y_pred = (y_scores >= optimal_th).astype(int)
+    y_pred = (y_scores >= threshold).astype(int)
     loss = log_loss(y_test, y_pred)
-    opt_precision = precision_score(y_test, y_pred)
+    opt_precision = precision_score(y_test, y_pred, zero_division=1)
     opt_recall = recall_score(y_test, y_pred)
     #  Evaluate performance
     conf_matrix = confusion_matrix(y_test, y_pred)
@@ -974,7 +1014,7 @@ def evaluate_precision_recall_optimized_model(mh_o, cb_model, metric='f1'):
     """
     # Train model and optimize for recall. 
     # Return optimized threshold, including the fitted model 
-    opt_threshold, precision, recall, fitted_model = get_optimal_thresholds(
+    opt_threshold, precision, recall, _, fitted_model = get_optimal_thresholds(
         mh_o,
         cb_model,
         metric=metric
@@ -990,3 +1030,28 @@ def evaluate_precision_recall_optimized_model(mh_o, cb_model, metric='f1'):
         recall, mh_o.x_test, fitted_model, mh_o.y_test, y_pred, opt_precision,
             opt_recall, loss, opt_threshold
     )
+
+    return fitted_model
+
+def top_model_influencers(model, X, n_influencers=5, figsize=(10, 8)):
+    importance = model.feature_importances_
+    # SHAP values
+    explainer = shap.Explainer(model)
+    shap_values = explainer(X)
+    # Calculate mean SHAP values for each feature
+    mean_shap_values = np.mean(shap_values.values, axis=0)
+    # Create a DataFrame
+    shap_df = pd.DataFrame({'Feature': X.columns, 'Score': mean_shap_values})
+    # Sort by mean SHAP value
+    shap_df = shap_df.sort_values(by='Score', ascending=False)
+    # Create second df to store the top positive and negative influencer features
+    # Exclude date related features as the dates are batch jobs entry and not actual surver date entry
+    criteria = (shap_df['Feature'] != 'year') & (shap_df['Feature'] != 'month') & \
+        (shap_df['Feature'] != 'day') & (shap_df['Feature'] != 'hour') & (shap_df['Feature'] != 'minute')
+    tmp_df = shap_df[criteria]
+    topn_pos = tmp_df.head(n_influencers)
+    topn_neg = tmp_df.tail(n_influencers)
+    topn_shap_df = pd.concat([topn_pos, topn_neg])
+    topn_shap_df.reset_index(drop=True, inplace=True)
+    # Return the top negative and positive influencers specified by n_influencers.
+    return topn_shap_df
