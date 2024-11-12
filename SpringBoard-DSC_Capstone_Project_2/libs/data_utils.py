@@ -537,16 +537,19 @@ class MentalHealthData:
         """Custom step. Apply external pre-processing step as needed"""  
         self.__new_cols = cb_preprocess(self.__df)
 
-    def train_test_split(self, target='treatment') -> None:
+    def train_test_split(self, target='treatment', drop_duplicates=False) -> None:
         """
         Train/Test Split Mental health data set, then pre-process train and test data separately
         """
         # First drop 'Timestamp' column, then transform features with pre-defined steps.
         self.__df = self.__df.drop(labels='Timestamp', axis=1)
+        if drop_duplicates:
+            duplicated = self.__df.duplicated()
+            self.__df = self.__df[duplicated == False]
         # Convert target - a binary categorical feature to numeric
         self.__df[target] = self.__df[target].apply(lambda x: MentalHealthData.yes_no_num.get(x, x))
         # Transform!
-        self.__df = self.__fit_transform(self.__df)
+        self.__df = self.__fit_transform(self.__df, target)
         # Split train and test data while making sure that duplicates 
         # only stays in the Train set and not the test set.
         self.X_train, self.x_test, self.y_train, self.y_test, self.X, self.y = train_test_split_with_duplicates(
@@ -556,7 +559,7 @@ class MentalHealthData:
             random_state=self.random_state
         )
     
-    def __fit_transform(self, df) -> object:
+    def __fit_transform(self, df, target: str) -> object:
         """
         Pre-process identified train data features for the mental health data set.
         All identified features were thoroughly analyzed and evaluated prior 
@@ -574,13 +577,19 @@ class MentalHealthData:
         _df['self_employed'] = _df['self_employed'].fillna('Unknown')
 
         # convert 'Yes', 'No' to 1, 0 - Coping_Struggles, family_history, treatment
-        for col in df:
-            if len(df[col].unique()) == 2 and col != 'Gender':
-                df[col] = df[col].apply(lambda x: MentalHealthData.yes_no_num.get(x, x))
+        for col in _df:
+            if len(_df[col].unique()) == 2 and col != 'Gender':
+                _df[col] = _df[col].apply(lambda x: MentalHealthData.yes_no_num.get(x, x))
 
+        categorical_cols = _df.select_dtypes(include='object').columns
+        if _df.Country.value_counts().count() > 1: # Do not SMOTE on country modeling
+            # Resolve class imbalances - returns rebalanced DF
+            # We use SMOTE to oversample minority classses as the imbalance in some of the features is too great.
+            # It should not affect the already balanced features
+            imbalanced_categ_cols=['Gender', 'Country']
+            _df = apply_SMOTE_for_feature_class_imbalance(_df, target=target, columns=imbalanced_categ_cols)
         # one-hot encode
-        categorical_cols = df.select_dtypes(include='object').columns
-        df_encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=True)
+        df_encoded = pd.get_dummies(_df, columns=categorical_cols, drop_first=True)
         df_encoded.columns = df_encoded.columns.str.replace(' ', '_') 
 
         return df_encoded.astype(int)
@@ -693,34 +702,37 @@ def train_report_scores(mh_obj, model: BaseEstimator, target='treatment', plot=F
 # Create a callback function for the mental-health object custom step.
 # Create feature from 'Timestamp'.
 def pre_process_timestamp(df):
-  # First, convert 'Timestamp' to datetime
-  df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+  if 'Timestamp' in df.columns:
+    # First, convert 'Timestamp' to datetime
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
 
-  # Create year, month, day, and hour columns
-  df['year'] = df['Timestamp'].dt.year
-  df['month'] = df['Timestamp'].dt.month
-  df['day'] = df['Timestamp'].dt.day    
-  df['hour'] = df['Timestamp'].dt.hour  
-  df['minute'] = df['Timestamp'].dt.minute   
-  # Convert to ordinal values
-  df['year'] = df['year'].astype(int)  
-  df['month'] = df['month'].astype(int) 
-  df['day'] = df['day'].astype(int)     
-  df['hour'] = df['hour'].astype(int)   
-  df['minute'] = df['minute'].astype(int)
+    # Create year, month, day, and hour columns
+    df['year'] = df['Timestamp'].dt.year
+    df['month'] = df['Timestamp'].dt.month
+    df['day'] = df['Timestamp'].dt.day    
+    df['hour'] = df['Timestamp'].dt.hour  
+    df['minute'] = df['Timestamp'].dt.minute   
+    # Convert to ordinal values
+    df['year'] = df['year'].astype(int)  
+    df['month'] = df['month'].astype(int) 
+    df['day'] = df['day'].astype(int)     
+    df['hour'] = df['hour'].astype(int)   
+    df['minute'] = df['minute'].astype(int)
 
   return ['year', 'month', 'day', 'hour', 'minute']
 
-def mental_health_instance(df):
-  mh_o = MentalHealthData(df) 
-  # Apply timestamp feature creation before we drop the timestamp column
-  mh_o.pre_process(pre_process_timestamp)
-  # Pre-processing the data, then split
-  mh_o.train_test_split()
+def mental_health_instance(df, drop_duplicates=False):
+    mh_o = MentalHealthData(df) 
+    # Apply timestamp feature creation before we drop the timestamp column
+    if drop_duplicates == False:
+        mh_o.pre_process(pre_process_timestamp)
 
-  return mh_o
+    # Pre-processing the data, then split
+    mh_o.train_test_split(drop_duplicates=drop_duplicates)
 
-def evaluate_by_feature_country(df, callback_get_model):
+    return mh_o
+
+def evaluate_by_feature_country(df, callback_get_model, drop_duplicates=False):
     
     # Get All Country feature names
     #countries = [col for col in df.columns if col.startswith('Country_')]
@@ -729,11 +741,11 @@ def evaluate_by_feature_country(df, callback_get_model):
 
     for country in countries:
         country_df = df[df['Country'] == country]
-        mho_country = mental_health_instance(country_df.copy()) 
         # Process if we have at least 1 'YES' or 1 'NO', 
         # otherwise we cannot create a model off this country data.
         vc = country_df.treatment.value_counts()
         if vc.count() > 1:
+            mho_country = mental_health_instance(country_df.copy(), drop_duplicates=drop_duplicates) 
             # Create new model each time 
             model = callback_get_model()
             msg, acc, auc, cv = train_report_scores(mho_country, model) 
@@ -829,7 +841,7 @@ def TPOT_test(mh_df):
         print('Classification Report:\n', result['classification_report'])
 
 def analyze_tradeoffs(mh_o, cb_get_model):
-
+    from rich.console import Console
     opt_threshold, precision, recall, thresholds, fitted_model = get_optimal_thresholds(
         mh_o,
         cb_get_model,
@@ -838,8 +850,8 @@ def analyze_tradeoffs(mh_o, cb_get_model):
     # Prepare to store TP and FN
     results = []
 
-    pos_th = [(idx, t) for idx, t in enumerate(thresholds) if t >= opt_threshold][:10]
-    neg_th = []#[(idx, t) for idx, t in enumerate(thresholds) if t < opt_threshold][:5]
+    pos_th = [(idx, t) for idx, t in enumerate(thresholds) if t >= opt_threshold][:5]
+    neg_th = [(idx, t) for idx, t in enumerate(thresholds) if t < opt_threshold][:5]
     _thresholds = neg_th + pos_th
     # Reclassify model using the optimized TH.
     for idx, threshold in _thresholds:
@@ -850,10 +862,11 @@ def analyze_tradeoffs(mh_o, cb_get_model):
         )
         results.append({
             'Threshold': threshold, 
-            'Precision': f'{precision[idx]:.3f}',
-            'Recall': f'{recall[idx]:.3f}',
+            'Precision': f'{precision[idx]:.6f}',
+            'Recall': f'{recall[idx]:.6f}',
             'True Positives': cm[1, 1], 
-            'False Negatives': cm[1, 0]
+            'False Negatives': cm[1, 0],
+            'False Positives': cm[0, 1],
         })
     
     return pd.DataFrame(results)
@@ -1175,3 +1188,90 @@ def feature_reduction_kbest(df, target, k=10):
   # Display results
   print("Selected Features:", selected_features)
   print("Scores of selected features:", k_best.scores_[k_best.get_support(indices=True)])
+
+def apply_SMOTE_for_feature_class_imbalance(df, target:str, columns: list[str], random_state=random_state):
+    """
+    Apply SMOTE(Synthetic Minority Oversampling Techniques) to 
+    underrepresented categorical feature classes.
+
+    """
+    from imblearn.over_sampling import SMOTENC
+
+    X = df.drop(columns=target)
+    y = df[target]
+
+    # Get indices
+    all_categorical = X.select_dtypes(exclude=[np.number]).columns.tolist()
+    
+    indices = [X.columns.get_loc(col) for col in all_categorical]
+    smote_nc = SMOTENC(categorical_features=indices, random_state=random_state)
+
+    X_resampled, y_resampled = smote_nc.fit_resample(X, y)
+    # Return the resample DF
+    resampled_df = pd.concat([
+        pd.DataFrame(X_resampled, columns=X.columns),
+        pd.DataFrame(y_resampled, columns=[target])
+    ], axis=1)
+
+    
+    return resampled_df 
+
+def get_optimized_rf_model(mh_o):
+
+    rfo = rf_optimizer(mh_o.X_train, mh_o.y_train, mh_o.x_test, mh_o.y_test)
+
+    best_rf_params = rfo.max['params']
+    criterion = criterion_str(best_rf_params['criterion'])
+    best_rf_model = RandomForestClassifier(
+        n_estimators=int(best_rf_params['n_estimators']),
+        max_depth=int(best_rf_params['max_depth']),
+        min_samples_split=int(best_rf_params['min_samples_split']),
+        criterion=criterion,
+        random_state=random_state,
+        verbose=0,
+        n_jobs=-1
+    )
+
+    return best_rf_model
+
+def get_optimized_lgb_model(mh_o):
+
+    lgo = lgb_optimizer(mh_o.X_train, mh_o.y_train, mh_o.x_test, mh_o.y_test) 
+
+    best_lgb_params = lgo.max['params']
+    best_lgb_model = LGBMClassifier(
+        objective=objective_str(best_lgb_params['objective']),
+        metric=metric_str(best_lgb_params['metric']),
+        is_unbalance=is_unbalance_b(best_lgb_params['is_unbalance']),
+        num_leaves=int(best_lgb_params['num_leaves']),
+        max_depth=int(best_lgb_params['max_depth']),
+        learning_rate=float(best_lgb_params['learning_rate']),
+        n_estimators=int(best_lgb_params['n_estimators']),
+        lambda_l2=float(best_lgb_params['lambda_l2']),
+        lambda_l1=float(best_lgb_params['lambda_l1']),
+        min_child_samples=int(best_lgb_params['min_child_samples']),
+        min_data_in_leaf=int(best_lgb_params['min_data_in_leaf']),
+        boosting_type=boosting_type_str(best_lgb_params['boosting_type']),
+        random_state=random_state,
+        verbose=-1,
+        n_jobs=-1
+    )
+
+    return best_lgb_model
+
+def get_optimized_xgb_model(mh_o):
+
+    xgo = xgb_optimizer(mh_o.X_train, mh_o.y_train, mh_o.x_test, mh_o.y_test) 
+
+    best_xgb_params = xgo.max['params']
+    best_xgb_model = XGBClassifier(
+        objective='binary:logistic',
+        n_estimators=int(best_xgb_params['n_estimators']),
+        max_depth=int(best_xgb_params['max_depth']),
+        learning_rate=best_xgb_params['learning_rate'],
+        gamma=best_xgb_params['gamma'],
+        random_state=random_state,
+        n_jobs=-1
+    )
+
+    return best_xgb_model
