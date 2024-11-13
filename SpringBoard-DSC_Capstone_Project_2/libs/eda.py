@@ -6,6 +6,13 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
 from sklearn.feature_selection import RFE
 from sklearn.linear_model import Lasso
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import make_scorer, confusion_matrix, f1_score, classification_report
+from sklearn.model_selection import cross_val_score, cross_val_predict
+from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, RocCurveDisplay
+from sklearn.metrics import precision_score, recall_score, accuracy_score
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -418,56 +425,39 @@ class MentalHealthData():
         #    random_state=random_state
         #)
 
-def model_evaluation_test(mh_o, target, model):
-    """
-    Base model test and show performance results.
-    Metrics:   
-    cross-val score using F1 balanced weighting.
-    Confusion matrix of 15-fold cross validated model.
-    """
-    from sklearn.model_selection import StratifiedKFold
-    from sklearn.metrics import make_scorer, confusion_matrix, f1_score, classification_report
-    from sklearn.model_selection import cross_val_score, cross_val_predict
-    from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, RocCurveDisplay
-    from sklearn.metrics import precision_score, recall_score
-
+def model_evaluation_test(mh_o, model):
     import data_utils as utils
+    
+    y_test, X, y = mh_o.y_test, mh_o.X, mh_o.y
 
-    random_state = 243
-    X, y = mh_o.X, mh_o.y
-
-    # Use cross_val_predict to get predictions for each fold
-    kf = StratifiedKFold(n_splits=15)
-    y_pred = cross_val_predict(model, X, y, cv=kf)
+    precision, recall, opt_precision, opt_recall, y_pred = utils.get_classification_metrics(
+        mh_o, 
+        model
+    ) 
 
     # Print Confusion matrix
-    cm = confusion_matrix(y, y_pred)
+    cm = confusion_matrix(y_test, y_pred)
     print('\nConfusion Matrix (Treatment Required):')
     print(f' No: {cm[0]}')
     print(f'Yes: {cm[1]}')
     # Print Classification Report
-    report = classification_report(y, y_pred)
+    report = classification_report(y_test, y_pred)
     print('\nClassification Report:')
     print(report)
 
     # Print the cross-validation score
     custom_scorer = make_scorer(f1_score, average='weighted')
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=utils.random_state)
     cv_scores = cross_val_score(model, X, y, scoring=custom_scorer, cv=kf) 
     print(f'Cross-V Mean Score: {cv_scores.mean():.4f}')
     print(f'Cross-V Scores:\n{cv_scores}')   
-    
-    # Get precision and recall scores
-    _y = y.squeeze() # DF to Series
-    y_probs = cross_val_predict(model, X, y, cv=kf, method='predict_proba')[:,1]
-    precision, recall, _ = precision_recall_curve(_y, y_probs)
-    avg_precision = average_precision_score(_y, y_probs, average='weighted')
-    opt_precision = precision_score(_y, y_pred, zero_division=1, average='weighted')
-    opt_recall = recall_score(_y, y_pred, average='weighted')
+    print(f'Opt. Precision: {opt_precision}')
+    print(f'Opt. Recall: {opt_recall}')
+
     # Plot PRC and ROC
     fig, ax = plt.subplots(1, 2, figsize=(6.5, 3.5))
     # Plot PR Curve
-    ax[0].plot(recall, precision, marker='.', 
-        label='PR curve (AP={:.2f})'.format(avg_precision))
+    ax[0].plot(recall, precision, marker='.')
     ax[0].set_title('Precision-Recall Curve')
     ax[0].plot(opt_recall, opt_precision, 'ro', markersize=8, label='Optimal TH')
     ax[0].legend()
@@ -475,7 +465,7 @@ def model_evaluation_test(mh_o, target, model):
     ax[0].set_ylabel('Precision')
     plt.grid()
     # Plot ROC Curve
-    RocCurveDisplay.from_predictions(_y, y_pred, ax=ax[1])
+    RocCurveDisplay.from_predictions(y_test, y_pred, ax=ax[1])
     ax[1].set_title('ROC Curve')
     plt.grid()
     plt.tight_layout()
@@ -485,42 +475,42 @@ def analyze_tradeoffs(mh_o, model):
     from sklearn.metrics import precision_recall_curve, confusion_matrix, f1_score
     from sklearn.model_selection import cross_val_predict, StratifiedKFold
 
-    X, y = mh_o.X, mh_o.y
+    X_train, x_test, y_train, y_test = mh_o.X_train, mh_o.x_test, mh_o.y_train, mh_o.y_test
 
-    kf = StratifiedKFold(n_splits=15)
-    y_pred = cross_val_predict(model, X, y, cv=kf)
+    model.fit(X_train, y_train)
+    #y_pred = model.predict(x_test)
+    y_probs = model.predict_proba(x_test)[:,1]
 
-    _y = y.squeeze() # DF to Series
-    y_probs = cross_val_predict(model, X, y, cv=kf, method='predict_proba')[:,1]
-    precision, recall, thresholds = precision_recall_curve(_y, y_probs)
-
-    results = []
-    scores = [f1_score(y, y_pred >= t) for t in thresholds]
-    optimal_idx = np.argmax(scores)
-    opt_threshold = thresholds[optimal_idx]
-
-    pos_th = [(idx, t) for idx, t in enumerate(thresholds) if t >= opt_threshold][:5]
-    neg_th = [(idx, t) for idx, t in enumerate(thresholds) if t < opt_threshold][:5]
-    _thresholds = pos_th + neg_th
-    # Reclassify model using the optimized TH.
-    for idx, threshold in _thresholds:
-        if threshold < 0:
-            y_pred = np.where(y_probs < threshold, 1, 0)
+    precision, recall, thresholds = precision_recall_curve(y_test, y_probs)
+    # Calculate F1 scores and find the index of the optimal threshold (maximize F1 score)
+    f1_scores = []
+    for p, r in zip(precision, recall):
+        if (p + r) != 0:  # Avoid division by zero
+            f1_scores.append(2 * (p * r) / (p + r))
         else:
-            y_pred = np.where(y_probs >= threshold, 1, 0)
-            
-        # Calculate confusion matrix
-        cm = confusion_matrix(y, y_pred)
-        results.append({
-            'Threshold': threshold, 
-            'Precision': f'{precision[idx]:.6f}',
-            'Recall': f'{recall[idx]:.6f}',
-            'True Positives': cm[1, 1], 
-            'False Negatives': cm[1, 0],
-            'False Positives': cm[0, 1],
-        })
-    
-    return pd.DataFrame(results)
+            f1_scores.append(0)
+    f1_scores = f1_scores[:-1]
+    opt_th_idx = np.argmax(f1_scores)
+    # Select thresholds around the optimal threshold, 5 thresholds on each side
+    _thresholds = []
+    th_range = 150 # Include 25 TH points on each side of the optimal TH.
+    intervals = 30 # Skip 5 TH at a time
+    # Ensure not to exceed the bounds of the threshold list
+    start_idx = max(0, opt_th_idx - th_range)
+    end_idx = min(len(thresholds), opt_th_idx + th_range + 1)
+    # Iterate over the selected thresholds
+    for i in range(start_idx, end_idx, intervals):
+        threshold = thresholds[i]
+        y_pred = (y_probs >= threshold).astype(int)
+        # Get confusion matrix (TP, FP, FN, TN)
+        _, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+        # Calculate cost (example: assume cost of FP = 1 and FN = 2)
+        cost = fp + 2 * fn
+        # Append row to the thresholds list
+        _thresholds.append([f'{threshold:.4f}', tp, fp, fn, f'{precision[i]:.4f}', f'{recall[i]:.4f}', cost])
+    # Return DataFrame
+    columns = ['Threshold', 'TP', 'FP', 'FN', 'Precision', 'Recall', 'Cost']
+    return pd.DataFrame(_thresholds, columns=columns)
 
 def chi2_comparison(df1, df2):
     """

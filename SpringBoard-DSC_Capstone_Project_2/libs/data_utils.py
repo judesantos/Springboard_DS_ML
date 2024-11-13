@@ -17,7 +17,7 @@ from sklearn.metrics import precision_recall_curve, average_precision_score
 from sklearn.metrics import make_scorer, roc_auc_score, f1_score, log_loss
 
 from sklearn.model_selection import train_test_split
-from sklearn.model_selection import cross_val_score, cross_val_predict
+from sklearn.model_selection import cross_val_score, cross_val_predict, StratifiedKFold
 from sklearn.model_selection import KFold
 
 from sklearn.ensemble import RandomForestClassifier
@@ -209,7 +209,7 @@ def xgb_eval(n_estimators, max_depth, learning_rate, gamma, X, y, x_t, y_t):
     
     return accuracy
 	
-def xgb_optimizer(X, y, x_t, y_t):
+def xgb_optimizer(X, y, x_t, y_t, verbose=0):
     """XGB Model Hyperparams optimizer""" 
     # Define hyperparameter boundaries
     xgb_param_grid = {
@@ -580,7 +580,7 @@ class MentalHealthData:
         for col in _df:
             if len(_df[col].unique()) == 2 and col != 'Gender':
                 _df[col] = _df[col].apply(lambda x: MentalHealthData.yes_no_num.get(x, x))
-
+       
         categorical_cols = _df.select_dtypes(include='object').columns
         if _df.Country.value_counts().count() > 1: # Do not SMOTE on country modeling
             # Resolve class imbalances - returns rebalanced DF
@@ -732,6 +732,60 @@ def mental_health_instance(df, drop_duplicates=False):
 
     return mh_o
 
+def evaluate_model(mh_obj, model: BaseEstimator, target='treatment'):
+    """
+    Model evaluation check for precision-recall scores.
+    Run cross validation and 
+    Return scores
+    """
+    X, y = mh_obj.X, mh_obj.y
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # Get out-of-sample predictions using cross-validation
+    y_pred = cross_val_predict(model, X, y, cv=kf)
+    y_probs = cross_val_predict(model, X, y, cv=kf, method='predict_proba')[:,1]
+    # Calculate Precision-Recall curve
+    precision, recall, thresholds = precision_recall_curve(y, y_probs)
+    # Calculate F1 score for each threshold
+    f1_scores = 2 * (precision * recall) / (precision + recall)
+    # Find the threshold that gives the optimal F1 score
+    optimal_th_index = f1_scores.argmax()
+    optimal_th = thresholds[optimal_th_index]
+    # Convert predictions to labels based on the optimal threshold
+    #y_opt_pred = (y_probs >= optimal_th).astype(int)
+    # Calculate precision, recall, accuracy, confusion matrix, and F1 score
+    precision = precision_score(y, y_pred)
+    recall = recall_score(y, y_pred)
+    accuracy = accuracy_score(y, y_pred)
+    cm = confusion_matrix(y, y_pred)
+    f1 = f1_score(y, y_pred)
+
+    return precision, recall, accuracy, f1, optimal_th, cm
+
+def evaluate_by_country(df, callback_get_model, drop_duplicates=False):
+    """Evaluate model by Country feature"""
+    # Get All Country feature names
+    results = [];
+    countries = df.Country.unique()
+    for country in countries:
+        country_df = df[df['Country'] == country]
+        mho_country = mental_health_instance(country_df.copy(), drop_duplicates=drop_duplicates) 
+        # Create new model each time 
+        model = callback_get_model()
+        precision, recall, accuracy, f1, th, _ = evaluate_model(mho_country, model) 
+        results.append([
+            country,
+            f'{th:.3f}',
+            f'{precision:.3f}',
+            f'{recall:.3f}', 
+            f'{accuracy:.3f}',
+            f'{f1:.3f}', 
+        ])
+
+    columns = ['Country', 'Threshold', 'Precision', 'Recall', 'Accuracy', 'F1']
+    df = pd.DataFrame(results, columns=columns)
+
+    return df
+
 def evaluate_by_feature_country(df, callback_get_model, drop_duplicates=False):
     
     # Get All Country feature names
@@ -854,7 +908,7 @@ def analyze_tradeoffs(mh_o, cb_get_model):
     neg_th = [(idx, t) for idx, t in enumerate(thresholds) if t < opt_threshold][:5]
     _thresholds = neg_th + pos_th
     # Reclassify model using the optimized TH.
-    for idx, threshold in _thresholds:
+    for idx, threshold in enumerate(_thresholds):
         _, _, _, _, cm, _ = reclassify_model(
             mh_o,
             fitted_model,
@@ -871,6 +925,22 @@ def analyze_tradeoffs(mh_o, cb_get_model):
     
     return pd.DataFrame(results)
     
+def get_classification_metrics(mh_o, model):
+    X_train, x_test, y_train, y_test = mh_o.X_train, mh_o.x_test, mh_o.y_train, \
+        mh_o.y_test
+
+    model.fit(X_train, y_train)
+    y_pred = model.predict(x_test)
+    y_probs = model.predict_proba(x_test)[:,1]
+
+    f1 = f1_score(y_test, y_pred)
+    acc = accuracy_score(y_test, y_pred)
+    precision, recall, thresholds = precision_recall_curve(y_test, y_probs)
+    # Calculate optimal TH
+    opt_precision = precision_score(y_test, y_pred, zero_division=1, average='weighted')
+    opt_recall = recall_score(y_test, y_pred, average='weighted')
+
+    return precision, recall, thresholds, opt_precision, opt_recall, y_pred
 
 def get_prc_thresholds(mh_o, cb_get_model):
     """Get precision_recall curve values, including test data predictions and the fitted model"""
@@ -880,11 +950,11 @@ def get_prc_thresholds(mh_o, cb_get_model):
     model = cb_get_model()
     model.fit(X_train, y_train)
     # Predict 
-    y_pred = model.predict_proba(x_test)[:, 1]
+    y_prob = model.predict_proba(x_test)[:, 1]
     # return precision, recall, threshold 
-    precision, recall, thresholds = precision_recall_curve(y_test, y_pred)
+    precision, recall, thresholds = precision_recall_curve(y_test, y_prob)
 
-    return model, y_pred, precision, recall, thresholds 
+    return model, y_prob, precision, recall, thresholds 
 
 
 def get_optimal_thresholds(mh_df, cb_get_model, metric='f1'):
@@ -1271,6 +1341,7 @@ def get_optimized_xgb_model(mh_o):
         learning_rate=best_xgb_params['learning_rate'],
         gamma=best_xgb_params['gamma'],
         random_state=random_state,
+        verbosity=0,
         n_jobs=-1
     )
 
