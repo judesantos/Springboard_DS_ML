@@ -430,7 +430,7 @@ def model_evaluation_test(mh_o, model):
     
     y_test, X, y = mh_o.y_test, mh_o.X, mh_o.y
 
-    precision, recall, opt_precision, opt_recall, y_pred = utils.get_classification_metrics(
+    precision, recall, _, opt_precision, opt_recall, y_pred = utils.get_classification_metrics(
         mh_o, 
         model
     ) 
